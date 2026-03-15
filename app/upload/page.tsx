@@ -8,7 +8,6 @@ import { detectMonthFromWorkbook } from '@/lib/utils/parser';
 
 import { useRawDataStore } from '@/store/rawDataStore';
 import { useOutputStore } from '@/store/outputStore';
-import { processWorkbook } from './actions';
 import MonthSelector, { type MonthPeriodRecord } from '@/components/upload/MonthSelector';
 import FileChecklist from '@/components/upload/FileChecklist';
 import ProcessingStatus from '@/components/upload/ProcessingStatus';
@@ -35,6 +34,10 @@ function getCurrentMonth(): string {
   return new Date().toLocaleString('en-IN', { month: 'short', year: 'numeric' });
 }
 
+function formatMegabytes(bytes: number): string {
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 // ── Types ─────────────────────────────────────────────────────────────────
 
 interface UploadRecord {
@@ -46,6 +49,22 @@ interface UploadRecord {
 }
 
 type Tab = 'combined' | 'individual';
+
+type CombinedStatusStage =
+  | 'idle'
+  | 'reading'
+  | 'parsing'
+  | 'ready'
+  | 'serializing'
+  | 'processing';
+
+interface CombinedStatus {
+  stage: CombinedStatusStage;
+  fileName: string | null;
+  fileSize: number | null;
+  progressPct?: number;
+  detail?: string;
+}
 
 type EditableCell = string | number | boolean | Date | null | undefined;
 type EditableSheetMap = Record<string, EditableCell[][]>;
@@ -107,6 +126,7 @@ export default function UploadPage() {
     setProcessing,
     setError,
     monthlyPeriodId,
+    setMonthlyPeriod,
   } = useRawDataStore();
 
   const { setUploadResult } = useOutputStore();
@@ -122,6 +142,11 @@ export default function UploadPage() {
   const [editableSheets, setEditableSheets]     = useState<EditableSheetMap>({});
   const [initialEditableSheets, setInitialEditableSheets] = useState<EditableSheetMap>({});
   const [hasRawEdits, setHasRawEdits]           = useState(false);
+  const [combinedStatus, setCombinedStatus]     = useState<CombinedStatus>({
+    stage: 'idle',
+    fileName: null,
+    fileSize: null,
+  });
 
   // ── Sync month input with selected period ────────────────────────────────
   useEffect(() => {
@@ -144,22 +169,57 @@ export default function UploadPage() {
       const file = accepted[0];
       if (!file) return;
       setError(null);
+      setCombinedStatus({
+        stage: 'reading',
+        fileName: file.name,
+        fileSize: file.size,
+        progressPct: 0,
+        detail: 'Reading selected workbook…',
+      });
 
       if (file.size > MAX_BYTES) {
         setError('File is too large. Maximum allowed size is 50 MB.');
+        setCombinedStatus({
+          stage: 'idle',
+          fileName: null,
+          fileSize: null,
+        });
         return;
       }
 
       const reader = new FileReader();
+      reader.onprogress = (evt) => {
+        if (!evt.lengthComputable) return;
+        const progressPct = Math.max(0, Math.min(100, Math.round((evt.loaded / evt.total) * 100)));
+        setCombinedStatus(prev => (
+          prev.stage === 'reading'
+            ? { ...prev, progressPct }
+            : prev
+        ));
+      };
+
       reader.onload = e => {
         const buffer = e.target?.result as ArrayBuffer;
         try {
+          setCombinedStatus(prev => ({
+            ...prev,
+            stage: 'parsing',
+            detail: 'Parsing workbook sheets…',
+            progressPct: 100,
+          }));
+
           const wb = XLSX.read(new Uint8Array(buffer), { type: 'array', cellDates: true });
           setWorkbook(wb, file.name);
           const editable = workbookToEditableSheetMap(wb);
           setEditableSheets(editable);
           setInitialEditableSheets(cloneEditableSheetMap(editable));
           setHasRawEdits(false);
+          setCombinedStatus(prev => ({
+            ...prev,
+            stage: 'ready',
+            detail: `${wb.SheetNames.length} sheet${wb.SheetNames.length !== 1 ? 's' : ''} ready for review.`,
+            progressPct: undefined,
+          }));
           // 14G: Auto-detect month from workbook sheet names and pre-fill if field is empty
           const detected = detectMonthFromWorkbook(wb);
           if (detected) setMonth(prev => (prev === getCurrentMonth() || !prev.trim()) ? detected : prev);
@@ -168,8 +228,23 @@ export default function UploadPage() {
           setEditableSheets({});
           setInitialEditableSheets({});
           setHasRawEdits(false);
+          setCombinedStatus({
+            stage: 'idle',
+            fileName: null,
+            fileSize: null,
+          });
         }
       };
+
+      reader.onerror = () => {
+        setError('Could not read the file. Please try uploading again.');
+        setCombinedStatus({
+          stage: 'idle',
+          fileName: null,
+          fileSize: null,
+        });
+      };
+
       reader.readAsArrayBuffer(file);
     },
     [setWorkbook, setError],
@@ -194,6 +269,11 @@ export default function UploadPage() {
     setEditableSheets({});
     setInitialEditableSheets({});
     setHasRawEdits(false);
+    setCombinedStatus({
+      stage: 'idle',
+      fileName: null,
+      fileSize: null,
+    });
     setError(null);
   };
 
@@ -279,27 +359,149 @@ export default function UploadPage() {
     setProcessing(true);
     setError(null);
 
+    let processedSuccessfully = false;
+
     try {
+      setCombinedStatus(prev => ({
+        ...prev,
+        stage: 'serializing',
+        detail: hasRawEdits
+          ? 'Preparing edited workbook for processing…'
+          : 'Preparing workbook for processing…',
+        progressPct: undefined,
+      }));
+
+      // Ensure we process against a persisted monthly period.
+      const periodRes = await fetch('/api/monthly-periods', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ month: month.trim() }),
+      });
+      const periodData = await periodRes.json();
+      if (!periodRes.ok || !periodData?.period?._id) {
+        throw new Error(periodData?.error ?? 'Could not prepare reporting period.');
+      }
+      const resolvedPeriodId = String(periodData.period._id);
+      setMonthlyPeriod(resolvedPeriodId);
+
       const workbookToProcess = Object.keys(editableSheets).length
         ? buildWorkbookFromEditableMap(workbook.SheetNames, editableSheets)
         : workbook;
 
-      const workbookBytes = XLSX.write(workbookToProcess, {
-        type: 'array',
-        bookType: 'xlsx',
-        compression: true,
-      }) as ArrayBuffer;
+      // Upload each sheet as an individual small COMBINED_WORKBOOK payload to avoid
+      // large function payloads in production deployments.
+      const sheetNames = workbookToProcess.SheetNames;
+      if (sheetNames.length === 0) {
+        throw new Error('Workbook has no sheets to upload.');
+      }
 
-      const blob = new Blob([workbookBytes], {
-        type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      let completedUploads = 0;
+      const totalSheets = sheetNames.length;
+      const concurrency = Math.min(3, Math.max(1, totalSheets - 1));
+
+      const uploadOneSheet = async (sheetName: string, resetCombined = false) => {
+        const worksheet = workbookToProcess.Sheets[sheetName];
+        if (!worksheet) return;
+
+        setCombinedStatus(prev => ({
+          ...prev,
+          stage: 'processing',
+          detail: `Uploading raw sheets… ${completedUploads}/${totalSheets} completed (current: ${sheetName})`,
+          progressPct: Math.round((completedUploads / totalSheets) * 100),
+        }));
+
+        const oneSheetWorkbook = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(oneSheetWorkbook, worksheet, sheetName);
+
+        const oneSheetBytes = XLSX.write(oneSheetWorkbook, {
+          type: 'array',
+          bookType: 'xlsx',
+          compression: true,
+        }) as ArrayBuffer;
+
+        const oneSheetBlob = new Blob([oneSheetBytes], {
+          type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        });
+
+        const rawFd = new FormData();
+        rawFd.append('file', oneSheetBlob, `${fileName}-${sheetName}.xlsx`);
+        rawFd.append('fileType', 'COMBINED_WORKBOOK');
+        rawFd.append('monthlyPeriodId', resolvedPeriodId);
+        if (resetCombined) {
+          rawFd.append('resetCombined', '1');
+        }
+
+        const rawRes = await fetch('/api/raw-upload', {
+          method: 'POST',
+          body: rawFd,
+        });
+        const rawData = await rawRes.json().catch(() => ({}));
+        if (!rawRes.ok) {
+          throw new Error(rawData?.error ?? `Failed to upload raw sheet: ${sheetName}`);
+        }
+
+        completedUploads += 1;
+        setCombinedStatus(prev => ({
+          ...prev,
+          stage: 'processing',
+          detail: `Uploaded ${completedUploads}/${totalSheets} raw sheets…`,
+          progressPct: Math.round((completedUploads / totalSheets) * 100),
+        }));
+      };
+
+      // First upload resets any prior combined snapshot docs for this period.
+      const [firstSheet, ...restSheets] = sheetNames;
+      if (firstSheet) {
+        await uploadOneSheet(firstSheet, true);
+      }
+
+      const uploadQueue = [...restSheets];
+
+      const worker = async () => {
+        while (uploadQueue.length > 0) {
+          const nextSheet = uploadQueue.shift();
+          if (!nextSheet) break;
+          await uploadOneSheet(nextSheet);
+        }
+      };
+
+      if (uploadQueue.length > 0) {
+        await Promise.all(Array.from({ length: Math.min(concurrency, uploadQueue.length) }, () => worker()));
+      }
+
+      setCombinedStatus(prev => ({
+        ...prev,
+        stage: 'processing',
+        detail: 'Running processors and generating final sheets…',
+        progressPct: 100,
+      }));
+
+      const processRes = await fetch('/api/process-month', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          monthlyPeriodId: resolvedPeriodId,
+          month: month.trim(),
+        }),
       });
-      const fd = new FormData();
-      fd.append('file', blob, fileName);
-      fd.append('fileName', fileName);
-      fd.append('month', month.trim());
 
-      const result = await processWorkbook(fd);
-      setUploadResult(result.uploadId, month, result.pl, result.errors, {
+      const result = await processRes.json();
+      if (!processRes.ok) {
+        const suffix = Array.isArray(result?.missingSheets) && result.missingSheets.length
+          ? ` Missing: ${result.missingSheets.join(', ')}`
+          : '';
+        throw new Error((result?.error ?? 'Processing failed.') + suffix);
+      }
+
+      processedSuccessfully = true;
+
+      setCombinedStatus(prev => ({
+        ...prev,
+        stage: 'processing',
+        detail: 'Final sheets generated. Opening dashboard…',
+      }));
+
+      setUploadResult(result.uploadId, result.month ?? month, result.pl, result.errors ?? [], {
         ordersSheet:       result.ordersSheet,
         kpiSheet:          result.kpiSheet,
         amazonStatewisePL: result.amazonStatewisePL,
@@ -308,8 +510,20 @@ export default function UploadPage() {
       router.push('/dashboard');
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : 'Processing failed.');
+      setCombinedStatus(prev => ({
+        ...prev,
+        stage: 'ready',
+        detail: 'Processing failed. Please retry after checking the workbook.',
+      }));
     } finally {
       setProcessing(false);
+      if (!processedSuccessfully && workbook) {
+        setCombinedStatus(prev => ({
+          ...prev,
+          stage: 'ready',
+          detail: prev.detail ?? `${workbook.SheetNames.length} sheets ready for review.`,
+        }));
+      }
     }
   };
 
@@ -415,6 +629,46 @@ export default function UploadPage() {
                 </>
               )}
             </div>
+
+            {(combinedStatus.stage !== 'idle' || workbook) && (
+              <div className="border border-gray-200 rounded-xl p-4 bg-gray-50 space-y-2">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div className="flex items-center gap-2 min-w-0">
+                    {(combinedStatus.stage === 'reading' || combinedStatus.stage === 'parsing' || combinedStatus.stage === 'serializing' || combinedStatus.stage === 'processing') ? (
+                      <div className="h-4 w-4 rounded-full border-2 border-blue-500 border-t-transparent animate-spin" />
+                    ) : (
+                      <div className="h-4 w-4 rounded-full bg-green-500" />
+                    )}
+                    <p className="text-sm font-medium text-gray-800 truncate">
+                      {combinedStatus.fileName ?? fileName ?? 'No file selected'}
+                    </p>
+                  </div>
+                  {combinedStatus.fileSize != null && (
+                    <span className="text-xs text-gray-500">
+                      {formatMegabytes(combinedStatus.fileSize)}
+                    </span>
+                  )}
+                </div>
+
+                <p className="text-xs text-gray-600">
+                  {combinedStatus.detail ?? (workbook ? 'Workbook is ready.' : 'Select a workbook to continue.')}
+                </p>
+
+                {(combinedStatus.stage === 'reading' || combinedStatus.stage === 'processing') && typeof combinedStatus.progressPct === 'number' && (
+                  <div className="space-y-1">
+                    <div className="h-1.5 w-full rounded-full bg-gray-200 overflow-hidden">
+                      <div
+                        className="h-full bg-blue-500 transition-all"
+                        style={{ width: `${combinedStatus.progressPct}%` }}
+                      />
+                    </div>
+                    <p className="text-[11px] text-gray-500">
+                      {combinedStatus.stage === 'reading' ? 'Reading' : 'Uploading'} {combinedStatus.progressPct}%
+                    </p>
+                  </div>
+                )}
+              </div>
+            )}
 
             {/* Workbook preview */}
             {workbook && (
@@ -644,6 +898,31 @@ export default function UploadPage() {
               onComplete={handleProcessComplete}
               onClose={() => setShowProcessingModal(false)}
             />
+          </div>
+        </div>
+      )}
+
+      {activeTab === 'combined' && isProcessing && (
+        <div className="fixed inset-0 z-[60] bg-black/40 p-4 flex items-center justify-center">
+          <div className="bg-white rounded-xl shadow-2xl w-full max-w-md p-6 space-y-4">
+            <div className="flex items-start gap-3">
+              <div className="mt-0.5 h-6 w-6 rounded-full border-2 border-blue-500 border-t-transparent animate-spin" />
+              <div className="min-w-0">
+                <h2 className="text-base font-semibold text-gray-900">Converting Workbook</h2>
+                <p className="text-sm text-gray-600 truncate mt-0.5">
+                  {combinedStatus.fileName ?? fileName ?? 'Current workbook'}
+                </p>
+              </div>
+            </div>
+
+            <div className="space-y-2 text-sm">
+              <div className="rounded-lg bg-blue-50 border border-blue-100 px-3 py-2 text-blue-700 animate-pulse">
+                {combinedStatus.detail ?? 'Processing your workbook…'}
+              </div>
+              <p className="text-xs text-gray-500">
+                Please keep this page open. Large workbooks can take a little time.
+              </p>
+            </div>
           </div>
         </div>
       )}

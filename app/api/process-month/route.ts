@@ -28,9 +28,12 @@ export async function POST(req: NextRequest) {
 
     const reportingMonth = (month ?? period.month).trim();
 
-    // Fetch all raw files for this period, sorted oldest first so newer files
-    // win during sheet-name deduplication inside assembleWorkbook()
-    const rawFiles = await RawFileStore.find({ monthlyPeriodId }).sort({ uploadedAt: 1 });
+    // Fetch all raw files for this period using the compound index to avoid
+    // in-memory sort on large sheet payload documents.
+    const rawFiles = await RawFileStore.find({ monthlyPeriodId })
+      .sort({ fileType: 1 })
+      .hint({ monthlyPeriodId: 1, fileType: 1 })
+      .lean();
 
     if (rawFiles.length === 0) {
       return NextResponse.json(
@@ -39,19 +42,24 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Validate: check which required sheets are still missing
-    const allSheets = Array.from(
-      new Set(rawFiles.flatMap(r => r.sheets.map((s: { sheetName: string }) => s.sheetName))),
-    );
-    const missingSheets = getMissingSheets(allSheets);
-    if (missingSheets.length > 0) {
-      return NextResponse.json(
-        {
-          error: `${missingSheets.length} required sheet(s) are still missing.`,
-          missingSheets,
-        },
-        { status: 422 },
+    // Validate required sheets only for individual-file mode.
+    // In combined-workbook mode, buildPL can still run and emit partial-data errors
+    // instead of hard-failing the whole conversion.
+    const hasCombinedSnapshot = rawFiles.some((r: any) => String(r.fileType ?? '').startsWith('COMBINED_WORKBOOK::'));
+    if (!hasCombinedSnapshot) {
+      const allSheets = Array.from(
+        new Set(rawFiles.flatMap((r: any) => (r.sheets ?? []).map((s: { sheetName: string }) => s.sheetName))),
       );
+      const missingSheets = getMissingSheets(allSheets);
+      if (missingSheets.length > 0) {
+        return NextResponse.json(
+          {
+            error: `${missingSheets.length} required sheet(s) are still missing.`,
+            missingSheets,
+          },
+          { status: 422 },
+        );
+      }
     }
 
     // Assemble a virtual workbook from all uploaded files

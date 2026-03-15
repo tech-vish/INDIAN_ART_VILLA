@@ -14,6 +14,7 @@ export async function POST(req: NextRequest) {
     const file             = formData.get('file') as File | null;
     const fileType         = formData.get('fileType') as FileType | null;
     const monthlyPeriodId  = formData.get('monthlyPeriodId') as string | null;
+    const resetCombined    = formData.get('resetCombined') === '1';
 
     if (!file)            return NextResponse.json({ error: 'No file provided.' }, { status: 400 });
     if (!fileType)        return NextResponse.json({ error: 'fileType is required.' }, { status: 400 });
@@ -21,8 +22,9 @@ export async function POST(req: NextRequest) {
 
     await connectDB();
 
-    const period = await MonthlyPeriod.findById(monthlyPeriodId);
-    if (!period) return NextResponse.json({ error: 'Monthly period not found.' }, { status: 404 });
+    const periodObjectId = new mongoose.Types.ObjectId(monthlyPeriodId);
+    const periodExists = await MonthlyPeriod.exists({ _id: periodObjectId });
+    if (!periodExists) return NextResponse.json({ error: 'Monthly period not found.' }, { status: 404 });
 
     // Parse the uploaded xlsx
     const buffer = await file.arrayBuffer();
@@ -32,58 +34,152 @@ export async function POST(req: NextRequest) {
     const sheetData = extractSheetData(wb, fileType);
     const sheetsDetected = sheetData.map(s => s.sheetName);
 
-    // Upsert: if this file type was already uploaded, replace it
-    const existingFile = await RawFileStore.findOne({
-      monthlyPeriodId: new mongoose.Types.ObjectId(monthlyPeriodId),
-      fileType,
-    });
-
-    let fileId: mongoose.Types.ObjectId;
-    if (existingFile) {
-      existingFile.fileName  = file.name;
-      existingFile.sheets    = sheetData;
-      existingFile.uploadedAt = new Date();
-      await existingFile.save();
-      fileId = existingFile._id;
-    } else {
-      const newRaw = await RawFileStore.create({
-        monthlyPeriodId: new mongoose.Types.ObjectId(monthlyPeriodId),
-        fileType,
-        fileName: file.name,
-        sheets: sheetData,
-      });
-      fileId = newRaw._id;
+    if (sheetData.length === 0) {
+      return NextResponse.json({ error: 'No valid sheet data found in uploaded file.' }, { status: 422 });
     }
 
-    // Update MonthlyPeriod.uploadedFiles entry for this fileType
-    const existingEntry = period.uploadedFiles.find((f) => f.fileType === fileType);
-    if (existingEntry) {
-      existingEntry.fileName   = file.name;
-      existingEntry.uploadedAt = new Date();
-      existingEntry.sheetsFound = sheetsDetected;
-      existingEntry.fileId     = fileId;
+    let fileId: mongoose.Types.ObjectId;
+    let sheetsFoundForEntry: string[] = sheetsDetected;
+
+    if (fileType === 'COMBINED_WORKBOOK') {
+      // Combined mode stores one document per sheet to avoid a single huge BSON document.
+      if (resetCombined) {
+        await RawFileStore.deleteMany({
+          monthlyPeriodId: periodObjectId,
+          fileType: /^COMBINED_WORKBOOK(?:::.*)?$/,
+        });
+      } else {
+        await RawFileStore.deleteMany({
+          monthlyPeriodId: periodObjectId,
+          fileType: 'COMBINED_WORKBOOK',
+        });
+      }
+
+      const upsertedIds: mongoose.Types.ObjectId[] = [];
+
+      for (const sheet of sheetData) {
+        const scopedFileType = `COMBINED_WORKBOOK::${sheet.sheetName}`;
+        const upserted = await RawFileStore.findOneAndUpdate(
+          { monthlyPeriodId: periodObjectId, fileType: scopedFileType },
+          {
+            $set: {
+              fileName: file.name,
+              sheets: [sheet],
+              uploadedAt: new Date(),
+            },
+            $setOnInsert: {
+              monthlyPeriodId: periodObjectId,
+              fileType: scopedFileType,
+            },
+          },
+          { upsert: true, returnDocument: 'after' },
+        )
+          .select('_id')
+          .lean();
+
+        if (upserted?._id) upsertedIds.push(upserted._id);
+      }
+
+      if (!upsertedIds[0]) {
+        return NextResponse.json({ error: 'Failed to store combined workbook sheets.' }, { status: 500 });
+      }
+      fileId = upsertedIds[0];
+
+      const combinedDocs = await RawFileStore.find({
+        monthlyPeriodId: periodObjectId,
+        fileType: /^COMBINED_WORKBOOK::/,
+      })
+        .select('sheets.sheetName')
+        .lean();
+
+      sheetsFoundForEntry = Array.from(
+        new Set(combinedDocs.flatMap(r => (r.sheets ?? []).map(s => s.sheetName))),
+      );
     } else {
-      period.uploadedFiles.push({
+      // Upsert: if this file type was already uploaded, replace it
+      const existingFile = await RawFileStore.findOne({
+        monthlyPeriodId: periodObjectId,
         fileType,
-        fileName:   file.name,
-        uploadedAt: new Date(),
-        sheetsFound: sheetsDetected,
-        fileId,
       });
+
+      if (existingFile) {
+        existingFile.fileName  = file.name;
+        existingFile.sheets    = sheetData;
+        existingFile.uploadedAt = new Date();
+        await existingFile.save();
+        fileId = existingFile._id;
+      } else {
+        const newRaw = await RawFileStore.create({
+          monthlyPeriodId: periodObjectId,
+          fileType,
+          fileName: file.name,
+          sheets: sheetData,
+        });
+        fileId = newRaw._id;
+      }
+
+      const sheetsForPeriodFileType = await RawFileStore.findOne({
+        monthlyPeriodId: periodObjectId,
+        fileType,
+      })
+        .select('sheets.sheetName')
+        .lean();
+      sheetsFoundForEntry = sheetsForPeriodFileType?.sheets?.map(s => s.sheetName) ?? sheetsDetected;
     }
 
     // Rebuild availableSheets from all uploaded files
     const allRaw = await RawFileStore.find({
-      monthlyPeriodId: new mongoose.Types.ObjectId(monthlyPeriodId),
-    });
+      monthlyPeriodId: periodObjectId,
+    })
+      .select('sheets.sheetName')
+      .lean();
     const allSheets = Array.from(
-      new Set(allRaw.flatMap(r => r.sheets.map(s => s.sheetName)))
+      new Set(allRaw.flatMap(r => (r.sheets ?? []).map(s => s.sheetName)))
     );
-    period.availableSheets = allSheets;
 
     // Recompute missingSheets based on canonical required sheet names
     const { getMissingSheets } = await import('@/lib/fileTypeRegistry');
-    period.missingSheets = getMissingSheets(allSheets);
+    const missingSheets = getMissingSheets(allSheets);
+
+    // Atomic update avoids optimistic-concurrency VersionError during parallel uploads.
+    const uploadedEntry = {
+      fileType,
+      fileName: file.name,
+      uploadedAt: new Date(),
+      sheetsFound: sheetsFoundForEntry,
+      fileId,
+    };
+
+    const updatedPeriod = await MonthlyPeriod.findOneAndUpdate(
+      { _id: periodObjectId },
+      [
+        {
+          $set: {
+            uploadedFiles: {
+              $concatArrays: [
+                {
+                  $filter: {
+                    input: { $ifNull: ['$uploadedFiles', []] },
+                    as: 'f',
+                    cond: { $ne: ['$$f.fileType', fileType] },
+                  },
+                },
+                [uploadedEntry],
+              ],
+            },
+            availableSheets: allSheets,
+            missingSheets,
+          },
+        },
+      ],
+      { returnDocument: 'after', updatePipeline: true },
+    )
+      .select('status')
+      .lean();
+
+    if (!updatedPeriod) {
+      return NextResponse.json({ error: 'Monthly period not found.' }, { status: 404 });
+    }
 
     // Resolve sheet names from this file for the response — include raw names too
     const rawSheetNames = wb.SheetNames.map(n => {
@@ -91,15 +187,13 @@ export async function POST(req: NextRequest) {
       return canonical ?? n;
     }).filter(Boolean);
 
-    await period.save();
-
     return NextResponse.json({
       fileId: fileId.toString(),
       sheetsDetected,
       rawSheetNames,
       availableSheets: allSheets,
-      missingSheets: period.missingSheets,
-      periodStatus: period.status,
+      missingSheets,
+      periodStatus: updatedPeriod.status,
     });
   } catch (e: any) {
     console.error('[raw-upload POST]', e);
@@ -134,9 +228,11 @@ export async function DELETE(req: NextRequest) {
     // Rebuild availableSheets
     const remaining = await RawFileStore.find({
       monthlyPeriodId: new mongoose.Types.ObjectId(monthlyPeriodId),
-    });
+    })
+      .select('sheets.sheetName')
+      .lean();
     const allSheets = Array.from(
-      new Set(remaining.flatMap(r => r.sheets.map(s => s.sheetName)))
+      new Set(remaining.flatMap(r => (r.sheets ?? []).map(s => s.sheetName)))
     );
     const { getMissingSheets } = await import('@/lib/fileTypeRegistry');
     const missingSheets = getMissingSheets(allSheets);

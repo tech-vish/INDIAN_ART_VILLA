@@ -44,7 +44,7 @@ async function loadFallbackSheetsByUploadId(uploadId: string): Promise<Map<strin
   if (!period?._id) return new Map();
 
   const rawFiles = await RawFileStore.find({ monthlyPeriodId: period._id })
-    .sort({ uploadedAt: 1 })
+    .sort({ uploadedAt: -1 })
     .select('sheets')
     .lean();
 
