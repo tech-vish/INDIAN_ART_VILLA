@@ -16,7 +16,7 @@ import { processIavIn, DEFAULT_IAV_IN_RESULT } from './iavInProcessor';
 import { processSalesBusy, DEFAULT_SALES_BUSY_RESULT } from './salesBusyProcessor';
 import { allocateExpenses, resolveInterestExpense } from './expenseAllocator';
 import { computeOrdersSheet, computeKPISheet, computeAmazonStatewisePL } from './outputSheets';
-import { connectDB, Upload, PLResult, MonthlyData, StatewiseData, MonthlyPeriod, OrdersData } from '../db';
+import { connectDB, Upload, PLResult, MonthlyData, StatewiseData, MonthlyPeriod, OrdersData, UploadRawSheet } from '../db';
 import { readSheet, safeNum, parseDate } from '../utils/parser';
 
 // ── Helpers ───────────────────────────────────────────────────────────────
@@ -188,6 +188,30 @@ export function buildPLOutput(month: string): PLOutput {
     netProfit:         row('Net Profit'),
     interestExpense:   0,
   };
+}
+
+function extractRawWorkbookSheets(wb: XLSX.WorkBook): Array<{
+  sheetName: string;
+  headers: string[];
+  data: unknown[][];
+  rowCount: number;
+}> {
+  return wb.SheetNames.map((sheetName) => {
+    const ws = wb.Sheets[sheetName];
+    const rows = ws
+      ? (XLSX.utils.sheet_to_json(ws, { header: 1, defval: null }) as unknown[][])
+      : [];
+    const headerRow = rows[0] ?? [];
+    const headers = headerRow.map((value) => String(value ?? ''));
+    const data = rows.slice(1);
+
+    return {
+      sheetName,
+      headers,
+      data,
+      rowCount: data.length,
+    };
+  });
 }
 
 export function plOutputToRows(pl: PLOutput): PLRow[] {
@@ -886,6 +910,8 @@ export async function buildPL(
       pl, amazonMonthlyRow, month, quarterlyRollup, previousMonthPLId,
     ).catch((): ComparativePL[] => []);
 
+    const rawWorkbookSheets = extractRawWorkbookSheets(wb);
+
     // STEP 6 — parse workbook monthwise sheet (kept for backward compat)
     let monthlyRows: MonthlyAmazonRow[] = [];
     try { monthlyRows = parseMonthlySheet(wb); } catch { /* non-fatal — monthwise sheet is optional */ }
@@ -920,10 +946,21 @@ export async function buildPL(
       status:     'complete',
     };
 
+    const saveRawSheetsTask = rawWorkbookSheets.length > 0
+      ? UploadRawSheet.insertMany(
+          rawWorkbookSheets.map((sheet) => ({ ...sheet, uploadId: upload._id })),
+        ).catch((err: unknown) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          errors.push(`Raw sheets snapshot not saved: ${msg}`);
+          return null;
+        })
+      : Promise.resolve(null);
+
     await Promise.all([
       MonthlyData.create({ uploadId: upload._id, rows: monthlyRowsForDB }),
       StatewiseData.create({ uploadId: upload._id, rows: amazonStatewise }),
       OrdersData.create({ uploadId: upload._id, month, data: combinedOrders }),
+      saveRawSheetsTask,
       monthlyPeriodId
         ? MonthlyPeriod.findByIdAndUpdate(monthlyPeriodId, periodUpdateFields)
         : Promise.resolve(),

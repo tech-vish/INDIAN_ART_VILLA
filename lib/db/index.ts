@@ -6,3 +6,4 @@ export { StatewiseData } from './models/StatewiseData';
 export { MonthlyPeriod } from './models/MonthlyPeriod';
 export { RawFileStore } from './models/RawFileStore';
 export { OrdersData } from './models/OrdersData';
+export { UploadRawSheet } from './models/UploadRawSheet';

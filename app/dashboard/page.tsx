@@ -10,6 +10,7 @@ import { useShallow } from 'zustand/shallow';
 import { useOutputStore, useKPISheet, useAmazonStatewisePL } from '@/store/outputStore';
 import type { PLOutput, OrdersSheet } from '@/lib/types';
 import ValidationPanel from '@/components/dashboard/ValidationPanel';
+import RawSheetsSection from '@/components/dashboard/RawSheetsSection';
 
 // ── Constants ─────────────────────────────────────────────────────────────
 
@@ -493,6 +494,9 @@ export default function DashboardPage() {
 
             {/* ── Validation panel ── */}
             <ValidationPanel pl={pl} />
+
+            {/* ── Raw sheets viewer ── */}
+            <RawSheetsSection uploadId={uploadId} />
           </>
         )}
 

@@ -1,6 +1,6 @@
 ﻿'use client';
 
-import { useState, useRef, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { useDropzone } from 'react-dropzone';
 import { useRouter } from 'next/navigation';
 import * as XLSX from 'xlsx';
@@ -12,6 +12,7 @@ import { processWorkbook } from './actions';
 import MonthSelector, { type MonthPeriodRecord } from '@/components/upload/MonthSelector';
 import FileChecklist from '@/components/upload/FileChecklist';
 import ProcessingStatus from '@/components/upload/ProcessingStatus';
+import RawWorkbookEditor from '@/components/upload/RawWorkbookEditor';
 
 // ── Constants ─────────────────────────────────────────────────────────────
 
@@ -46,6 +47,51 @@ interface UploadRecord {
 
 type Tab = 'combined' | 'individual';
 
+type EditableCell = string | number | boolean | Date | null | undefined;
+type EditableSheetMap = Record<string, EditableCell[][]>;
+
+function cloneEditableRows(rows: EditableCell[][]): EditableCell[][] {
+  return rows.map(row => [...row]);
+}
+
+function cloneEditableSheetMap(sheetMap: EditableSheetMap): EditableSheetMap {
+  return Object.fromEntries(
+    Object.entries(sheetMap).map(([sheetName, rows]) => [sheetName, cloneEditableRows(rows)]),
+  );
+}
+
+function workbookToEditableSheetMap(workbook: XLSX.WorkBook): EditableSheetMap {
+  const entries = workbook.SheetNames.map(sheetName => {
+    const ws = workbook.Sheets[sheetName];
+    const rows = ws
+      ? (XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' }) as EditableCell[][])
+      : [];
+    return [sheetName, rows];
+  });
+  return Object.fromEntries(entries);
+}
+
+function buildWorkbookFromEditableMap(
+  sheetNames: string[],
+  editableSheets: EditableSheetMap,
+): XLSX.WorkBook {
+  const wb = XLSX.utils.book_new();
+  for (const sheetName of sheetNames) {
+    const rows = editableSheets[sheetName] ?? [];
+    const ws = XLSX.utils.aoa_to_sheet(rows);
+    XLSX.utils.book_append_sheet(wb, ws, sheetName);
+  }
+  return wb;
+}
+
+function getSheetWidth(rows: EditableCell[][]): number {
+  let width = 0;
+  for (const row of rows) {
+    if (row.length > width) width = row.length;
+  }
+  return Math.max(1, width);
+}
+
 // ── Page ──────────────────────────────────────────────────────────────────
 
 export default function UploadPage() {
@@ -73,9 +119,9 @@ export default function UploadPage() {
   const [uploads, setUploads]                   = useState<UploadRecord[]>([]);
   const [loadingHistory, setLoadingHistory]     = useState(false);
   const [loadingId, setLoadingId]               = useState<string | null>(null);
-
-  // Keep raw file buffer so the server action can re-parse without re-reading the file
-  const rawBytesRef = useRef<ArrayBuffer | null>(null);
+  const [editableSheets, setEditableSheets]     = useState<EditableSheetMap>({});
+  const [initialEditableSheets, setInitialEditableSheets] = useState<EditableSheetMap>({});
+  const [hasRawEdits, setHasRawEdits]           = useState(false);
 
   // ── Sync month input with selected period ────────────────────────────────
   useEffect(() => {
@@ -110,13 +156,18 @@ export default function UploadPage() {
         try {
           const wb = XLSX.read(new Uint8Array(buffer), { type: 'array', cellDates: true });
           setWorkbook(wb, file.name);
-          rawBytesRef.current = buffer;
+          const editable = workbookToEditableSheetMap(wb);
+          setEditableSheets(editable);
+          setInitialEditableSheets(cloneEditableSheetMap(editable));
+          setHasRawEdits(false);
           // 14G: Auto-detect month from workbook sheet names and pre-fill if field is empty
           const detected = detectMonthFromWorkbook(wb);
           if (detected) setMonth(prev => (prev === getCurrentMonth() || !prev.trim()) ? detected : prev);
         } catch {
           setError('Could not parse file. Make sure it is a valid .xlsx workbook.');
-          rawBytesRef.current = null;
+          setEditableSheets({});
+          setInitialEditableSheets({});
+          setHasRawEdits(false);
         }
       };
       reader.readAsArrayBuffer(file);
@@ -140,12 +191,85 @@ export default function UploadPage() {
   // ── Handlers ─────────────────────────────────────────────────────────────
   const handleRemove = () => {
     clearWorkbook();
-    rawBytesRef.current = null;
+    setEditableSheets({});
+    setInitialEditableSheets({});
+    setHasRawEdits(false);
     setError(null);
   };
 
+  const handleCellChange = (sheetName: string, rowIndex: number, colIndex: number, value: string) => {
+    setEditableSheets(prev => {
+      const nextRows = cloneEditableRows(prev[sheetName] ?? []);
+
+      while (nextRows.length <= rowIndex) {
+        nextRows.push([]);
+      }
+
+      const targetRow = [...(nextRows[rowIndex] ?? [])];
+      while (targetRow.length <= colIndex) {
+        targetRow.push('');
+      }
+      targetRow[colIndex] = value;
+      nextRows[rowIndex] = targetRow;
+
+      return {
+        ...prev,
+        [sheetName]: nextRows,
+      };
+    });
+    setHasRawEdits(true);
+  };
+
+  const handleAddRow = (sheetName: string) => {
+    setEditableSheets(prev => {
+      const nextRows = cloneEditableRows(prev[sheetName] ?? []);
+      const width = getSheetWidth(nextRows);
+      nextRows.push(Array.from({ length: width }, () => ''));
+      return { ...prev, [sheetName]: nextRows };
+    });
+    setHasRawEdits(true);
+  };
+
+  const handleAddColumn = (sheetName: string) => {
+    setEditableSheets(prev => {
+      const nextRows = cloneEditableRows(prev[sheetName] ?? []);
+      if (nextRows.length === 0) {
+        nextRows.push(['']);
+      } else {
+        const width = getSheetWidth(nextRows);
+        for (let i = 0; i < nextRows.length; i += 1) {
+          const row = [...nextRows[i]];
+          row[width] = '';
+          nextRows[i] = row;
+        }
+      }
+      return { ...prev, [sheetName]: nextRows };
+    });
+    setHasRawEdits(true);
+  };
+
+  const handleResetSheet = (sheetName: string) => {
+    const next = {
+      ...editableSheets,
+      [sheetName]: cloneEditableRows(initialEditableSheets[sheetName] ?? []),
+    };
+    setEditableSheets(next);
+
+    const changed = Object.keys(next).some(name => {
+      const current = JSON.stringify(next[name] ?? []);
+      const initial = JSON.stringify(initialEditableSheets[name] ?? []);
+      return current !== initial;
+    });
+    setHasRawEdits(changed);
+  };
+
+  const handleResetAllSheets = () => {
+    setEditableSheets(cloneEditableSheetMap(initialEditableSheets));
+    setHasRawEdits(false);
+  };
+
   const handleProcess = async () => {
-    if (!rawBytesRef.current || !fileName) return;
+    if (!workbook || !fileName) return;
 
     if (!month.trim()) {
       setError('Please enter a reporting month before processing.');
@@ -156,7 +280,17 @@ export default function UploadPage() {
     setError(null);
 
     try {
-      const blob = new Blob([rawBytesRef.current], {
+      const workbookToProcess = Object.keys(editableSheets).length
+        ? buildWorkbookFromEditableMap(workbook.SheetNames, editableSheets)
+        : workbook;
+
+      const workbookBytes = XLSX.write(workbookToProcess, {
+        type: 'array',
+        bookType: 'xlsx',
+        compression: true,
+      }) as ArrayBuffer;
+
+      const blob = new Blob([workbookBytes], {
         type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
       });
       const fd = new FormData();
@@ -332,6 +466,24 @@ export default function UploadPage() {
               </div>
             )}
 
+            {workbook && (
+              <div className="relative left-1/2 w-[100dvw] -translate-x-1/2 px-4 sm:px-6 lg:px-8">
+                <div className="mx-auto max-w-[1800px]">
+                  <RawWorkbookEditor
+                    sheetNames={workbook.SheetNames}
+                    sheetData={editableSheets}
+                    hasEdits={hasRawEdits}
+                    fullPage
+                    onCellChange={handleCellChange}
+                    onAddRow={handleAddRow}
+                    onAddColumn={handleAddColumn}
+                    onResetSheet={handleResetSheet}
+                    onResetAll={handleResetAllSheets}
+                  />
+                </div>
+              </div>
+            )}
+
             {/* Month + Process */}
             {workbook && (
               <div className="border border-gray-200 rounded-xl p-5 space-y-4">
@@ -357,7 +509,7 @@ export default function UploadPage() {
 
                 <button
                   onClick={handleProcess}
-                  disabled={isProcessing || !rawBytesRef.current}
+                  disabled={isProcessing || !workbook}
                   className="inline-flex items-center gap-2 px-6 py-2.5 rounded-lg bg-blue-600 text-white text-sm font-medium hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                 >
                   {isProcessing ? (
@@ -369,7 +521,7 @@ export default function UploadPage() {
                       Processing…
                     </>
                   ) : (
-                    'Process Data'
+                    hasRawEdits ? 'Convert Edited Workbook To Final Sheets' : 'Convert To Final Sheets'
                   )}
                 </button>
               </div>
