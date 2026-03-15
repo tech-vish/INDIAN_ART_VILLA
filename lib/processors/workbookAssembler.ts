@@ -43,11 +43,13 @@ function sheetDataToWorksheet(
  */
 export function assembleWorkbook(rawFiles: IRawFileStore[]): XLSX.WorkBook {
   const wb = XLSX.utils.book_new();
-  // Track which canonical sheet names have already been added
-  const addedSheets = new Set<string>();
+  // Build merged sheet payloads first, then append once per canonical sheet.
+  const mergedSheets = new Map<string, { headers: string[]; data: unknown[][] }>();
 
   for (const rawFile of rawFiles) {
-    const fileType = rawFile.fileType as FileType;
+    const rawFileType = String(rawFile.fileType ?? '');
+    const fileType = rawFileType as FileType;
+    const isCombinedChunk = rawFileType.includes('::chunk::');
 
     for (const sheetData of rawFile.sheets) {
       // Resolve the raw sheet name using aliases (may return null = skip)
@@ -56,12 +58,27 @@ export function assembleWorkbook(rawFiles: IRawFileStore[]): XLSX.WorkBook {
         : sheetData.sheetName;
 
       if (canonicalName === null) continue;  // explicitly ignored
-      if (addedSheets.has(canonicalName)) continue;  // first-wins dedup
 
-      const ws = sheetDataToWorksheet(sheetData.headers, sheetData.data);
-      XLSX.utils.book_append_sheet(wb, ws, canonicalName);
-      addedSheets.add(canonicalName);
+      const existing = mergedSheets.get(canonicalName);
+      if (!existing) {
+        mergedSheets.set(canonicalName, {
+          headers: [...sheetData.headers],
+          data: [...sheetData.data],
+        });
+        continue;
+      }
+
+      // Chunked combined uploads store rows across multiple documents.
+      if (isCombinedChunk) {
+        existing.data.push(...sheetData.data);
+      }
+      // For non-chunk duplicates, keep first-wins behavior.
     }
+  }
+
+  for (const [sheetName, payload] of mergedSheets) {
+    const ws = sheetDataToWorksheet(payload.headers, payload.data);
+    XLSX.utils.book_append_sheet(wb, ws, sheetName);
   }
 
   return wb;

@@ -15,6 +15,15 @@ export async function POST(req: NextRequest) {
     const fileType         = formData.get('fileType') as FileType | null;
     const monthlyPeriodId  = formData.get('monthlyPeriodId') as string | null;
     const resetCombined    = formData.get('resetCombined') === '1';
+    const chunkIndexRaw    = formData.get('chunkIndex') as string | null;
+    const chunkTotalRaw    = formData.get('chunkTotal') as string | null;
+
+    const chunkIndex = Number.parseInt(chunkIndexRaw ?? '', 10);
+    const chunkTotal = Number.parseInt(chunkTotalRaw ?? '', 10);
+    const hasChunkMeta = Number.isFinite(chunkIndex)
+      && Number.isFinite(chunkTotal)
+      && chunkIndex > 0
+      && chunkTotal > 0;
 
     if (!file)            return NextResponse.json({ error: 'No file provided.' }, { status: 400 });
     if (!fileType)        return NextResponse.json({ error: 'fileType is required.' }, { status: 400 });
@@ -58,7 +67,10 @@ export async function POST(req: NextRequest) {
       const upsertedIds: mongoose.Types.ObjectId[] = [];
 
       for (const sheet of sheetData) {
-        const scopedFileType = `COMBINED_WORKBOOK::${sheet.sheetName}`;
+        const chunkSuffix = hasChunkMeta
+          ? `::chunk::${String(chunkIndex).padStart(6, '0')}`
+          : '';
+        const scopedFileType = `COMBINED_WORKBOOK::${sheet.sheetName}${chunkSuffix}`;
         const upserted = await RawFileStore.findOneAndUpdate(
           { monthlyPeriodId: periodObjectId, fileType: scopedFileType },
           {

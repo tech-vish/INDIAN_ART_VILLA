@@ -29,6 +29,8 @@ const REQUIRED_SHEETS = [
 ] as const;
 
 const MAX_BYTES = 50 * 1024 * 1024; // 50 MB
+const MAX_RAW_UPLOAD_PAYLOAD_BYTES = 3 * 1024 * 1024; // keep below Vercel function request limits
+const MAX_ROWS_PER_UPLOAD_CHUNK = 1200;
 
 function getCurrentMonth(): string {
   return new Date().toLocaleString('en-IN', { month: 'short', year: 'numeric' });
@@ -101,6 +103,75 @@ function buildWorkbookFromEditableMap(
     XLSX.utils.book_append_sheet(wb, ws, sheetName);
   }
   return wb;
+}
+
+function buildOneSheetWorkbookBytes(sheetName: string, rows: EditableCell[][]): ArrayBuffer {
+  const wb = XLSX.utils.book_new();
+  const ws = XLSX.utils.aoa_to_sheet(rows);
+  XLSX.utils.book_append_sheet(wb, ws, sheetName);
+  return XLSX.write(wb, {
+    type: 'array',
+    bookType: 'xlsx',
+    compression: true,
+  }) as ArrayBuffer;
+}
+
+function buildSheetUploadChunks(sheetName: string, ws: XLSX.WorkSheet): Array<{
+  chunkIndex: number;
+  chunkTotal: number;
+  bytes: ArrayBuffer;
+}> {
+  const aoa = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' }) as EditableCell[][];
+  const header = [...(aoa[0] ?? [])];
+  const dataRows = aoa.slice(1);
+
+  if (dataRows.length === 0) {
+    const bytes = buildOneSheetWorkbookBytes(sheetName, [header]);
+    if (bytes.byteLength > MAX_RAW_UPLOAD_PAYLOAD_BYTES) {
+      throw new Error(`Sheet '${sheetName}' is too large to upload.`);
+    }
+    return [{ chunkIndex: 1, chunkTotal: 1, bytes }];
+  }
+
+  const chunks: Array<{ bytes: ArrayBuffer; rowCount: number }> = [];
+  let cursor = 0;
+
+  while (cursor < dataRows.length) {
+    let take = Math.min(MAX_ROWS_PER_UPLOAD_CHUNK, dataRows.length - cursor);
+    let acceptedBytes: ArrayBuffer | null = null;
+    let acceptedTake = 0;
+
+    while (take >= 1) {
+      const rows = [header, ...dataRows.slice(cursor, cursor + take)];
+      const bytes = buildOneSheetWorkbookBytes(sheetName, rows);
+
+      if (bytes.byteLength <= MAX_RAW_UPLOAD_PAYLOAD_BYTES) {
+        acceptedBytes = bytes;
+        acceptedTake = take;
+        break;
+      }
+
+      if (take === 1) {
+        throw new Error(`Sheet '${sheetName}' has very wide rows; split the source file and retry.`);
+      }
+
+      take = Math.max(1, Math.floor(take / 2));
+    }
+
+    if (!acceptedBytes || acceptedTake <= 0) {
+      throw new Error(`Could not prepare upload chunks for sheet '${sheetName}'.`);
+    }
+
+    chunks.push({ bytes: acceptedBytes, rowCount: acceptedTake });
+    cursor += acceptedTake;
+  }
+
+  const chunkTotal = chunks.length;
+  return chunks.map((chunk, idx) => ({
+    chunkIndex: idx + 1,
+    chunkTotal,
+    bytes: chunk.bytes,
+  }));
 }
 
 function getSheetWidth(rows: EditableCell[][]): number {
@@ -395,38 +466,48 @@ export default function UploadPage() {
         throw new Error('Workbook has no sheets to upload.');
       }
 
-      let completedUploads = 0;
-      const totalSheets = sheetNames.length;
-      const concurrency = Math.min(3, Math.max(1, totalSheets - 1));
-
-      const uploadOneSheet = async (sheetName: string, resetCombined = false) => {
+      const uploadUnits: Array<{ sheetName: string; chunkIndex: number; chunkTotal: number; bytes: ArrayBuffer }> = [];
+      for (const sheetName of sheetNames) {
         const worksheet = workbookToProcess.Sheets[sheetName];
-        if (!worksheet) return;
+        if (!worksheet) continue;
+        const chunks = buildSheetUploadChunks(sheetName, worksheet);
+        uploadUnits.push(...chunks.map(chunk => ({
+          sheetName,
+          chunkIndex: chunk.chunkIndex,
+          chunkTotal: chunk.chunkTotal,
+          bytes: chunk.bytes,
+        })));
+      }
 
+      if (uploadUnits.length === 0) {
+        throw new Error('No sheet chunks were generated for upload.');
+      }
+
+      let completedUploads = 0;
+      const totalUploads = uploadUnits.length;
+      const concurrency = Math.min(3, Math.max(1, totalUploads - 1));
+
+      const uploadUnit = async (
+        unit: { sheetName: string; chunkIndex: number; chunkTotal: number; bytes: ArrayBuffer },
+        resetCombined = false,
+      ) => {
         setCombinedStatus(prev => ({
           ...prev,
           stage: 'processing',
-          detail: `Uploading raw sheets… ${completedUploads}/${totalSheets} completed (current: ${sheetName})`,
-          progressPct: Math.round((completedUploads / totalSheets) * 100),
+          detail: `Uploading ${unit.sheetName} (chunk ${unit.chunkIndex}/${unit.chunkTotal})… ${completedUploads}/${totalUploads} completed`,
+          progressPct: Math.round((completedUploads / totalUploads) * 100),
         }));
 
-        const oneSheetWorkbook = XLSX.utils.book_new();
-        XLSX.utils.book_append_sheet(oneSheetWorkbook, worksheet, sheetName);
-
-        const oneSheetBytes = XLSX.write(oneSheetWorkbook, {
-          type: 'array',
-          bookType: 'xlsx',
-          compression: true,
-        }) as ArrayBuffer;
-
-        const oneSheetBlob = new Blob([oneSheetBytes], {
+        const oneSheetBlob = new Blob([unit.bytes], {
           type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
         });
 
         const rawFd = new FormData();
-        rawFd.append('file', oneSheetBlob, `${fileName}-${sheetName}.xlsx`);
+        rawFd.append('file', oneSheetBlob, `${fileName}-${unit.sheetName}-chunk-${unit.chunkIndex}.xlsx`);
         rawFd.append('fileType', 'COMBINED_WORKBOOK');
         rawFd.append('monthlyPeriodId', resolvedPeriodId);
+        rawFd.append('chunkIndex', String(unit.chunkIndex));
+        rawFd.append('chunkTotal', String(unit.chunkTotal));
         if (resetCombined) {
           rawFd.append('resetCombined', '1');
         }
@@ -437,31 +518,31 @@ export default function UploadPage() {
         });
         const rawData = await rawRes.json().catch(() => ({}));
         if (!rawRes.ok) {
-          throw new Error(rawData?.error ?? `Failed to upload raw sheet: ${sheetName}`);
+          throw new Error(rawData?.error ?? `Failed to upload raw sheet: ${unit.sheetName}`);
         }
 
         completedUploads += 1;
         setCombinedStatus(prev => ({
           ...prev,
           stage: 'processing',
-          detail: `Uploaded ${completedUploads}/${totalSheets} raw sheets…`,
-          progressPct: Math.round((completedUploads / totalSheets) * 100),
+          detail: `Uploaded ${completedUploads}/${totalUploads} raw chunks…`,
+          progressPct: Math.round((completedUploads / totalUploads) * 100),
         }));
       };
 
       // First upload resets any prior combined snapshot docs for this period.
-      const [firstSheet, ...restSheets] = sheetNames;
-      if (firstSheet) {
-        await uploadOneSheet(firstSheet, true);
+      const [firstUnit, ...restUnits] = uploadUnits;
+      if (firstUnit) {
+        await uploadUnit(firstUnit, true);
       }
 
-      const uploadQueue = [...restSheets];
+      const uploadQueue = [...restUnits];
 
       const worker = async () => {
         while (uploadQueue.length > 0) {
-          const nextSheet = uploadQueue.shift();
-          if (!nextSheet) break;
-          await uploadOneSheet(nextSheet);
+          const nextUnit = uploadQueue.shift();
+          if (!nextUnit) break;
+          await uploadUnit(nextUnit);
         }
       };
 
