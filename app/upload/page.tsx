@@ -29,8 +29,9 @@ const REQUIRED_SHEETS = [
 ] as const;
 
 const MAX_BYTES = 50 * 1024 * 1024; // 50 MB
-const MAX_RAW_UPLOAD_PAYLOAD_BYTES = 3 * 1024 * 1024; // keep below Vercel function request limits
-const MAX_ROWS_PER_UPLOAD_CHUNK = 1200;
+const MAX_RAW_UPLOAD_CHUNK_BYTES = 2.8 * 1024 * 1024; // stays below common serverless body limits with form-data overhead
+const MAX_ROWS_PER_UPLOAD_CHUNK = 4000;
+const textEncoder = new TextEncoder();
 
 function getCurrentMonth(): string {
   return new Date().toLocaleString('en-IN', { month: 'short', year: 'numeric' });
@@ -105,72 +106,84 @@ function buildWorkbookFromEditableMap(
   return wb;
 }
 
-function buildOneSheetWorkbookBytes(sheetName: string, rows: EditableCell[][]): ArrayBuffer {
-  const wb = XLSX.utils.book_new();
-  const ws = XLSX.utils.aoa_to_sheet(rows);
-  XLSX.utils.book_append_sheet(wb, ws, sheetName);
-  return XLSX.write(wb, {
-    type: 'array',
-    bookType: 'xlsx',
-    compression: true,
-  }) as ArrayBuffer;
+function normalizeCellForTransport(value: EditableCell): string | number | boolean | null {
+  if (value == null) return null;
+  if (value instanceof Date) return value.toISOString();
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    return value;
+  }
+  return String(value);
+}
+
+function trimTrailingEmptyCells<T>(row: T[], isEmpty: (v: T) => boolean): T[] {
+  let end = row.length;
+  while (end > 0 && isEmpty(row[end - 1])) {
+    end -= 1;
+  }
+  return row.slice(0, end);
 }
 
 function buildSheetUploadChunks(sheetName: string, ws: XLSX.WorkSheet): Array<{
   chunkIndex: number;
   chunkTotal: number;
-  bytes: ArrayBuffer;
+  headers: string[];
+  rows: Array<Array<string | number | boolean | null>>;
 }> {
   const aoa = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' }) as EditableCell[][];
-  const header = [...(aoa[0] ?? [])];
-  const dataRows = aoa.slice(1);
+  const headers = trimTrailingEmptyCells(
+    (aoa[0] ?? []).map(v => String(v ?? '')),
+    (v) => v.trim() === '',
+  );
+
+  const dataRows = aoa
+    .slice(1)
+    .map((row) => trimTrailingEmptyCells(
+      row.map(normalizeCellForTransport),
+      (v) => v === null || v === '',
+    ))
+    .filter((row) => row.length > 0);
 
   if (dataRows.length === 0) {
-    const bytes = buildOneSheetWorkbookBytes(sheetName, [header]);
-    if (bytes.byteLength > MAX_RAW_UPLOAD_PAYLOAD_BYTES) {
-      throw new Error(`Sheet '${sheetName}' is too large to upload.`);
-    }
-    return [{ chunkIndex: 1, chunkTotal: 1, bytes }];
+    return [{ chunkIndex: 1, chunkTotal: 1, headers, rows: [] }];
   }
 
-  const chunks: Array<{ bytes: ArrayBuffer; rowCount: number }> = [];
+  const chunks: Array<{ rows: Array<Array<string | number | boolean | null>> }> = [];
   let cursor = 0;
 
   while (cursor < dataRows.length) {
-    let take = Math.min(MAX_ROWS_PER_UPLOAD_CHUNK, dataRows.length - cursor);
-    let acceptedBytes: ArrayBuffer | null = null;
-    let acceptedTake = 0;
+    const currentChunk: Array<Array<string | number | boolean | null>> = [];
+    let chunkBytes = 2; // []
 
-    while (take >= 1) {
-      const rows = [header, ...dataRows.slice(cursor, cursor + take)];
-      const bytes = buildOneSheetWorkbookBytes(sheetName, rows);
+    while (cursor < dataRows.length && currentChunk.length < MAX_ROWS_PER_UPLOAD_CHUNK) {
+      const nextRow = dataRows[cursor];
+      const nextRowBytes = textEncoder.encode(JSON.stringify(nextRow)).length + 1;
 
-      if (bytes.byteLength <= MAX_RAW_UPLOAD_PAYLOAD_BYTES) {
-        acceptedBytes = bytes;
-        acceptedTake = take;
+      if (currentChunk.length > 0 && chunkBytes + nextRowBytes > MAX_RAW_UPLOAD_CHUNK_BYTES) {
         break;
       }
 
-      if (take === 1) {
-        throw new Error(`Sheet '${sheetName}' has very wide rows; split the source file and retry.`);
+      if (currentChunk.length === 0 && nextRowBytes > MAX_RAW_UPLOAD_CHUNK_BYTES) {
+        throw new Error(`Sheet '${sheetName}' has a very wide row that exceeds upload limits.`);
       }
 
-      take = Math.max(1, Math.floor(take / 2));
+      currentChunk.push(nextRow);
+      chunkBytes += nextRowBytes;
+      cursor += 1;
     }
 
-    if (!acceptedBytes || acceptedTake <= 0) {
+    if (currentChunk.length === 0) {
       throw new Error(`Could not prepare upload chunks for sheet '${sheetName}'.`);
     }
 
-    chunks.push({ bytes: acceptedBytes, rowCount: acceptedTake });
-    cursor += acceptedTake;
+    chunks.push({ rows: currentChunk });
   }
 
   const chunkTotal = chunks.length;
   return chunks.map((chunk, idx) => ({
     chunkIndex: idx + 1,
     chunkTotal,
-    bytes: chunk.bytes,
+    headers,
+    rows: chunk.rows,
   }));
 }
 
@@ -466,7 +479,13 @@ export default function UploadPage() {
         throw new Error('Workbook has no sheets to upload.');
       }
 
-      const uploadUnits: Array<{ sheetName: string; chunkIndex: number; chunkTotal: number; bytes: ArrayBuffer }> = [];
+      const uploadUnits: Array<{
+        sheetName: string;
+        chunkIndex: number;
+        chunkTotal: number;
+        headers: string[];
+        rows: Array<Array<string | number | boolean | null>>;
+      }> = [];
       for (const sheetName of sheetNames) {
         const worksheet = workbookToProcess.Sheets[sheetName];
         if (!worksheet) continue;
@@ -475,7 +494,8 @@ export default function UploadPage() {
           sheetName,
           chunkIndex: chunk.chunkIndex,
           chunkTotal: chunk.chunkTotal,
-          bytes: chunk.bytes,
+          headers: chunk.headers,
+          rows: chunk.rows,
         })));
       }
 
@@ -485,10 +505,16 @@ export default function UploadPage() {
 
       let completedUploads = 0;
       const totalUploads = uploadUnits.length;
-      const concurrency = Math.min(3, Math.max(1, totalUploads - 1));
+      const concurrency = Math.min(10, Math.max(1, totalUploads - 1));
 
       const uploadUnit = async (
-        unit: { sheetName: string; chunkIndex: number; chunkTotal: number; bytes: ArrayBuffer },
+        unit: {
+          sheetName: string;
+          chunkIndex: number;
+          chunkTotal: number;
+          headers: string[];
+          rows: Array<Array<string | number | boolean | null>>;
+        },
         resetCombined = false,
       ) => {
         setCombinedStatus(prev => ({
@@ -498,23 +524,20 @@ export default function UploadPage() {
           progressPct: Math.round((completedUploads / totalUploads) * 100),
         }));
 
-        const oneSheetBlob = new Blob([unit.bytes], {
-          type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        });
-
-        const rawFd = new FormData();
-        rawFd.append('file', oneSheetBlob, `${fileName}-${unit.sheetName}-chunk-${unit.chunkIndex}.xlsx`);
-        rawFd.append('fileType', 'COMBINED_WORKBOOK');
-        rawFd.append('monthlyPeriodId', resolvedPeriodId);
-        rawFd.append('chunkIndex', String(unit.chunkIndex));
-        rawFd.append('chunkTotal', String(unit.chunkTotal));
-        if (resetCombined) {
-          rawFd.append('resetCombined', '1');
-        }
-
         const rawRes = await fetch('/api/raw-upload', {
           method: 'POST',
-          body: rawFd,
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            fileName,
+            fileType: 'COMBINED_WORKBOOK',
+            monthlyPeriodId: resolvedPeriodId,
+            sheetName: unit.sheetName,
+            headers: unit.headers,
+            rows: unit.rows,
+            chunkIndex: unit.chunkIndex,
+            chunkTotal: unit.chunkTotal,
+            resetCombined,
+          }),
         });
         const rawData = await rawRes.json().catch(() => ({}));
         if (!rawRes.ok) {
@@ -548,6 +571,27 @@ export default function UploadPage() {
 
       if (uploadQueue.length > 0) {
         await Promise.all(Array.from({ length: Math.min(concurrency, uploadQueue.length) }, () => worker()));
+      }
+
+      setCombinedStatus(prev => ({
+        ...prev,
+        stage: 'processing',
+        detail: 'Finalizing uploaded raw sheets…',
+      }));
+
+      const finalizeRes = await fetch('/api/raw-upload', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          fileType: 'COMBINED_WORKBOOK',
+          monthlyPeriodId: resolvedPeriodId,
+          fileName,
+          finalizeCombined: true,
+        }),
+      });
+      const finalizeData = await finalizeRes.json().catch(() => ({}));
+      if (!finalizeRes.ok) {
+        throw new Error(finalizeData?.error ?? 'Failed to finalize combined workbook upload.');
       }
 
       setCombinedStatus(prev => ({

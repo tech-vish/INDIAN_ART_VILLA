@@ -28,12 +28,15 @@ export async function POST(req: NextRequest) {
 
     const reportingMonth = (month ?? period.month).trim();
 
-    // Fetch all raw files for this period using the compound index to avoid
-    // in-memory sort on large sheet payload documents.
+    // Fetch lean docs and sort in memory to avoid index/hint mismatches across
+    // environments and to keep chunk ordering deterministic.
     const rawFiles = await RawFileStore.find({ monthlyPeriodId })
-      .sort({ fileType: 1 })
-      .hint({ monthlyPeriodId: 1, fileType: 1 })
+      .select('fileType sheets')
       .lean();
+
+    rawFiles.sort((a: any, b: any) =>
+      String(a.fileType ?? '').localeCompare(String(b.fileType ?? '')),
+    );
 
     if (rawFiles.length === 0) {
       return NextResponse.json(

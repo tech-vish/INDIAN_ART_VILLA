@@ -910,7 +910,10 @@ export async function buildPL(
       pl, amazonMonthlyRow, month, quarterlyRollup, previousMonthPLId,
     ).catch((): ComparativePL[] => []);
 
-    const rawWorkbookSheets = extractRawWorkbookSheets(wb);
+    const shouldPersistUploadRawSheets = !monthlyPeriodId;
+    const rawWorkbookSheets = shouldPersistUploadRawSheets
+      ? extractRawWorkbookSheets(wb)
+      : [];
 
     // STEP 6 — parse workbook monthwise sheet (kept for backward compat)
     let monthlyRows: MonthlyAmazonRow[] = [];
@@ -946,7 +949,7 @@ export async function buildPL(
       status:     'complete',
     };
 
-    const saveRawSheetsTask = rawWorkbookSheets.length > 0
+    const saveRawSheetsTask = shouldPersistUploadRawSheets && rawWorkbookSheets.length > 0
       ? UploadRawSheet.insertMany(
           rawWorkbookSheets.map((sheet) => ({ ...sheet, uploadId: upload._id })),
         ).catch((err: unknown) => {
